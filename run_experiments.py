@@ -3,7 +3,7 @@
 Hybrid Offline-Online Follower Manipulation — experiments matching experiment.md
 
 - Synthetic Stackelberg bandit: leader EXP3, follower UCB (FMUCB / Hybrid-FMUCB).
-- Metrics: T_{f,w} (suboptimal follower plays), convergence time, optional leader regret.
+- Metrics: T_{f,w} (suboptimal follower plays), time to sustained low rolling subopt. rate, optional leader regret.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Style
@@ -272,21 +273,27 @@ def build_offline_poor_coverage(
     return n_visits, sum_r
 
 
-def convergence_round(subopt: np.ndarray, window: int = 200) -> int:
+def convergence_round(
+    subopt: np.ndarray,
+    window: int = 200,
+    threshold: float = 0.2,
+    k_sustain: int = 3,
+) -> int:
     """
-    First round t where the rolling suboptimal-play rate drops to half the rate
-    in the initial window [0, window) — a relative "time to 50% improvement" metric.
+    First round index t (end of an online window) such that the rolling
+    suboptimal-play rate is at most `threshold` for `k_sustain` consecutive
+    window ends. Uses an absolute threshold so methods that already start
+    with a low rate are not penalized (unlike "halve the initial window").
     """
     h = len(subopt)
-    if h < window:
+    min_t = window + k_sustain - 1
+    if h < min_t:
         return h
-    base = float(subopt[:window].mean())
-    if base <= 0.0:
-        return window
-    target = 0.5 * base
-    for t in range(window, h + 1):
-        rate = float(subopt[t - window : t].mean())
-        if rate <= target:
+    for t in range(min_t, h + 1):
+        if all(
+            float(subopt[t - s - window : t - s].mean()) <= threshold
+            for s in range(k_sustain)
+        ):
             return t
     return h
 
@@ -310,11 +317,16 @@ def experiment1(
     gamma_exp3: float,
     n_off_grid: Sequence[int],
     cum_n_off: Optional[int] = None,
+    progress: bool = True,
 ) -> None:
     n_off_list = list(n_off_grid)
     cum_target = max(n_off_list) if cum_n_off is None else cum_n_off
     if cum_target not in n_off_list:
         cum_target = max(n_off_list)
+
+    conv_win = 200
+    conv_thr = 0.2
+    conv_k = 3
 
     t_fw_base = np.zeros((len(seeds), len(n_off_list)))
     t_fw_hyb = np.zeros((len(seeds), len(n_off_list)))
@@ -323,7 +335,9 @@ def experiment1(
     cum_base_rows: List[np.ndarray] = []
     cum_hyb_rows: List[np.ndarray] = []
 
-    for si, seed in enumerate(seeds):
+    for si, seed in enumerate(
+        tqdm(seeds, desc="Exp 1 (offline size × seeds)", unit="seed", disable=not progress)
+    ):
         rng = np.random.default_rng(seed)
         env = StackelbergBandit.sample(n_a, n_b, rng)
 
@@ -338,8 +352,12 @@ def experiment1(
 
             t_fw_base[si, j] = tr_b["subopt"].sum()
             t_fw_hyb[si, j] = tr_h["subopt"].sum()
-            conv_base[si, j] = convergence_round(tr_b["subopt"])
-            conv_hyb[si, j] = convergence_round(tr_h["subopt"])
+            conv_base[si, j] = convergence_round(
+                tr_b["subopt"], window=conv_win, threshold=conv_thr, k_sustain=conv_k
+            )
+            conv_hyb[si, j] = convergence_round(
+                tr_h["subopt"], window=conv_win, threshold=conv_thr, k_sustain=conv_k
+            )
 
             if n_off == cum_target:
                 cum_base_rows.append(np.cumsum(tr_b["subopt"].astype(np.float64)))
@@ -386,7 +404,7 @@ def experiment1(
     fig.savefig(p1, bbox_inches="tight")
     plt.close(fig)
 
-    # --- Plot 2: convergence time (50% improvement in rolling subopt. rate)
+    # --- Plot 2: rounds to sustained low rolling subopt. rate (absolute threshold)
     fig, ax = plt.subplots(figsize=(8.2, 5.0))
     ax.set_xscale("log")
     ax.grid(True, which="both", alpha=0.3)
@@ -399,8 +417,11 @@ def experiment1(
     ax.set_xticks(x_plot)
     ax.set_xticklabels(x_labels)
     ax.set_xlabel(r"$N_{\mathrm{off}}$")
-    ax.set_ylabel("Rounds to 50% improvement vs. initial window (lower is better)")
-    ax.set_title("Experiment 1: Time to halve initial rolling suboptimal-play rate")
+    ax.set_ylabel("Rounds to reach low rolling error rate (lower is better)")
+    ax.set_title(
+        rf"Experiment 1: Sustained low subopt. rate ($\leq {conv_thr}$, "
+        rf"{conv_k} consecutive windows of ${conv_win}$ rounds)"
+    )
     ax.legend(frameon=True, fancybox=True, shadow=True)
     _style_axis(ax)
     fig.tight_layout()
@@ -436,7 +457,10 @@ def experiment1(
     summary = {
         "n_off": n_off_list,
         "x_axis_log_shift_plus_1": True,
-        "convergence_metric": "first_t_where_rolling_mean_subopt_le_half_initial_window",
+        "convergence_metric": "first_t_where_rolling_subopt_rate_le_threshold_for_k_consecutive_window_ends",
+        "convergence_window": conv_win,
+        "convergence_threshold": conv_thr,
+        "convergence_k_sustain": conv_k,
         "cum_mistakes_n_off": cum_target,
         "tfw_baseline_mean": t_fw_base.mean(0).tolist(),
         "tfw_hybrid_mean": t_fw_hyb.mean(0).tolist(),
@@ -455,6 +479,7 @@ def experiment2(
     horizon: int,
     gamma_exp3: float,
     n_off_fixed: int,
+    progress: bool = True,
 ) -> None:
     t_fw: Dict[str, np.ndarray] = {"good": [], "poor": []}
     success: Dict[str, np.ndarray] = {"good": [], "poor": []}
@@ -462,7 +487,13 @@ def experiment2(
     for kind in ("good", "poor"):
         arr_t = np.zeros(len(seeds))
         arr_s = np.zeros(len(seeds))
-        for si, seed in enumerate(seeds):
+        seed_bar = tqdm(
+            seeds,
+            desc=f"Exp 2 ({kind} coverage)",
+            unit="seed",
+            disable=not progress,
+        )
+        for si, seed in enumerate(seed_bar):
             rng = np.random.default_rng(seed)
             env = StackelbergBandit.sample(n_a, n_b, rng)
             rng_h = np.random.default_rng(seed + 91_000)
@@ -577,13 +608,19 @@ def learning_curve_figure(
     horizon: int,
     gamma_exp3: float,
     n_off: int,
+    progress: bool = True,
 ) -> None:
     """Optional: rolling suboptimality rate over time (baseline vs hybrid)."""
     curves_b: List[np.ndarray] = []
     curves_h: List[np.ndarray] = []
     win = max(50, horizon // 100)
 
-    for seed in seeds:
+    for seed in tqdm(
+        seeds,
+        desc="Learning curves (optional)",
+        unit="seed",
+        disable=not progress,
+    ):
         rng = np.random.default_rng(seed)
         env = StackelbergBandit.sample(n_a, n_b, rng)
         rng_b = np.random.default_rng(seed + 3)
@@ -792,6 +829,7 @@ def experiment3_contextual(
     n_x: int,
     n_a: int,
     n_b: int,
+    progress: bool = True,
 ) -> None:
     d = n_x + n_a + n_b
     tfw_tab: List[float] = []
@@ -799,7 +837,7 @@ def experiment3_contextual(
     gen_tab: List[float] = []
     gen_ctx: List[float] = []
 
-    for seed in seeds:
+    for seed in tqdm(seeds, desc="Exp 3 (contextual)", unit="seed", disable=not progress):
         rng = np.random.default_rng(seed)
         theta_l = rng.uniform(-1.0, 1.0, d)
         theta_f = rng.uniform(-1.0, 1.0, d)
@@ -920,11 +958,17 @@ def main() -> None:
     )
     parser.add_argument("--exp3-n-off", type=int, default=1500, help="Offline size for Exp. 3")
     parser.add_argument("--n-x", type=int, default=5, help="Number of contexts |X| (Exp. 3)")
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars (e.g. for logs or CI)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     seeds = [args.base_seed + i for i in range(args.seeds)]
     n_off_grid = [0, 100, 500, 1000, 5000]
+    show_p = not args.no_progress
 
     experiment1(
         args.out_dir,
@@ -935,6 +979,7 @@ def main() -> None:
         args.gamma_exp3,
         n_off_grid,
         cum_n_off=args.exp1_cum_n_off,
+        progress=show_p,
     )
     experiment2(
         args.out_dir,
@@ -944,6 +989,7 @@ def main() -> None:
         args.horizon,
         args.gamma_exp3,
         args.exp2_n_off,
+        progress=show_p,
     )
     if not args.skip_learning_curves:
         learning_curve_figure(
@@ -954,6 +1000,7 @@ def main() -> None:
             args.horizon,
             args.gamma_exp3,
             n_off=1000,
+            progress=show_p,
         )
 
     if args.exp3:
@@ -966,6 +1013,7 @@ def main() -> None:
             args.n_x,
             args.n_a,
             args.n_b,
+            progress=show_p,
         )
 
     print(f"Wrote figures to {os.path.abspath(args.out_dir)}")
