@@ -18,7 +18,7 @@ inf_{gℓ ∈ G_{ℓ,t}} ∆_{F,a*}(gℓ) > 0). Follower optimality still uses U
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import numpy as np
 
@@ -95,6 +95,17 @@ def manipulation_contrast_leader_pessimistic(
     return float(lcb_target - max(others))
 
 
+def manipulation_contrast_leader_mean(
+    sum_r_l: np.ndarray,
+    n_visits: np.ndarray,
+    F: np.ndarray,
+    a_star: int,
+) -> float:
+    """Empirical ∆ using pooled means only (no LCB/UCB); looser, activates hybrid earlier in ablations."""
+    mu_hat = pooled_mean(sum_r_l, n_visits)
+    return float(manipulation_contrast(mu_hat, F, a_star))
+
+
 def true_best_manipulation(
     mu_l: np.ndarray,
     mu_f: np.ndarray,
@@ -135,6 +146,9 @@ def pooled_mean(sum_r: np.ndarray, n_visits: np.ndarray) -> np.ndarray:
     return sum_r.astype(np.float64) / n
 
 
+LeaderFeasibility = Literal["pessimistic", "mean"]
+
+
 def hybrid_fmucb_pick(
     a_t: int,
     n_visits: np.ndarray,
@@ -145,25 +159,36 @@ def hybrid_fmucb_pick(
     n_b: int,
     rng: np.random.Generator,
     eps: float = 1e-9,
+    follower_elim_eps: Optional[float] = None,
+    leader_feasibility: LeaderFeasibility = "pessimistic",
+    feasibility_margin: float = 0.0,
 ) -> int:
     """
     Tabular Hybrid-FMUCB step (Algorithm 1, tabular reduction):
 
-    * **Feasibility:** pessimistic leader contrast
-      ``manipulation_contrast_leader_pessimistic(...) > eps`` (robust to μ̂_ℓ noise).
+    * **Feasibility:** leader-side contrast ``> eps - feasibility_margin`` (default margin 0;
+      increase margin to soften strict pessimism when the feasible set is rarely non-empty).
+      Use ``leader_feasibility="mean"`` for ablations with pooled means only.
     * **Follower objective:** among feasible (F, a*), maximize UCB on μ_f(a*, b*).
 
-    Then b_t = F(a_t). If no feasible candidate, fall back to UCB best-response on μ_f at a_t.
+    Then b_t = F(a_t). If no feasible candidate, fall back to successive-elimination style
+    UCB on the row μ_f(a_t,·): keep arms with LCB ≥ max UCB − ε (default ε = 2 max bonus),
+    then play among survivors with max UCB.
     """
     mu_l_hat = pooled_mean(sum_r_l, n_visits)
 
     best_ucb = -np.inf
     best_F: Optional[np.ndarray] = None
+    feas_threshold = float(eps) - float(feasibility_margin)
 
     for a_star in range(n_a):
         for b_star in range(n_b):
             F = build_rule_F(a_star, b_star, mu_l_hat)
-            if manipulation_contrast_leader_pessimistic(sum_r_l, n_visits, F, a_star, t) <= eps:
+            if leader_feasibility == "mean":
+                contr = manipulation_contrast_leader_mean(sum_r_l, n_visits, F, a_star)
+            else:
+                contr = manipulation_contrast_leader_pessimistic(sum_r_l, n_visits, F, a_star, t)
+            if contr <= feas_threshold:
                 continue
             n = max(1, int(n_visits[a_star, b_star]))
             mean_f = float(sum_r_f[a_star, b_star]) / n
@@ -174,7 +199,9 @@ def hybrid_fmucb_pick(
                 best_F = F
 
     if best_F is None:
-        return _ucb_best_response_row(a_t, n_visits, sum_r_f, t, n_b, rng)
+        return _ucb_best_response_row(
+            a_t, n_visits, sum_r_f, t, n_b, rng, elim_eps=follower_elim_eps
+        )
 
     return int(best_F[a_t])
 
@@ -186,14 +213,28 @@ def _ucb_best_response_row(
     t: int,
     n_b: int,
     rng: np.random.Generator,
+    elim_eps: Optional[float] = None,
 ) -> int:
-    """UCB1 on μ_f(a,·) — fallback when M_t is empty."""
+    """
+    FMUCB-style fallback on μ_f(a,·) when the hybrid feasible set is empty:
+    keep b iff LCB_b ≥ max UCB − ε, then play among survivors with max UCB.
+    If ``elim_eps is None``, ε = 2·max bonus so the UCB leader always survives.
+    """
     na = np.maximum(1, n_visits[a].astype(np.float64))
     mean = sum_r[a] / na
     bonus = np.sqrt(2.0 * np.log(max(1, t)) / na)
+    lcb = mean - bonus
     ucb = mean + bonus
-    maxv = ucb.max()
-    cands = np.flatnonzero(np.isclose(ucb, maxv))
+    ucb_max = float(np.max(ucb))
+    eps = float(elim_eps) if elim_eps is not None else float(2.0 * np.max(bonus))
+    survive = lcb >= ucb_max - eps
+    if not np.any(survive):
+        maxv = float(np.max(ucb))
+        cands = np.flatnonzero(np.isclose(ucb, maxv))
+        return int(rng.choice(cands))
+    masked = np.where(survive, ucb, -np.inf)
+    maxv = float(np.max(masked))
+    cands = np.flatnonzero(np.isclose(masked, maxv))
     return int(rng.choice(cands))
 
 

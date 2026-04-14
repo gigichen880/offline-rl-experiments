@@ -1,6 +1,6 @@
 # Experiments: Hybrid Offline-Online Follower Manipulation
 
-This file describes the **implemented** synthetic experiments in `run_experiments.py` and how they match the **tabular reduction** of Hybrid-FMUCB (Algorithm 1). It should be read together with `hybrid_fmucb.py` and the paper.
+This file describes the **implemented** synthetic experiments (`experiment_1.py`, `experiment_2.py`, optional `experiment_3.py`; core logic in `experiment_common.py`; entry point `run_experiments.py`) and how they match the **tabular reduction** of Hybrid-FMUCB (Algorithm 1). Read together with `hybrid_fmucb.py` and the paper.
 
 ---
 

@@ -46,7 +46,11 @@ Experiment 3 counts **best-response** mistakes per round (contextual UCB / LinUC
 
 | Path | Role |
 | ---- | ---- |
-| `run_experiments.py` | CLI, environments, offline builders, all experiments, plotting |
+| `run_experiments.py` | CLI only: runs Exp 1–2 (and optional learning curve) by default; `--exp3` for contextual script |
+| `experiment_common.py` | `StackelbergBandit`, EXP3, offline builders, `simulate_run`, style, CI helpers |
+| `experiment_1.py` | Exp 1 figures + `learning_curve_figure` |
+| `experiment_2.py` | Exp 2 figures |
+| `experiment_3.py` | Optional contextual simulators + Exp 3 figure |
 | `hybrid_fmucb.py` | \(\Delta_{F,a}\), worst-response rules \(F_{a,b}\), pessimistic feasibility, `hybrid_fmucb_pick`, `true_best_manipulation` (\(F^{\mathrm{fm}}\)) |
 | `experiment.md` | Detailed alignment between experiments and implementation |
 
