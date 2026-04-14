@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Hybrid Offline-Online Follower Manipulation — experiments matching experiment.md
+Hybrid Offline-Online Follower Manipulation — experiments for the Stackelberg-bandit paper.
 
-- Synthetic Stackelberg bandit: leader EXP3, follower UCB (FMUCB / Hybrid-FMUCB).
-- Metrics: T_{f,w} (suboptimal follower plays), time to sustained low rolling subopt. rate, optional leader regret.
+- Leader: EXP3 on observed leader rewards (same as the paper).
+- Follower: tabular Hybrid-FMUCB (Algorithm 1, tabular reduction): worst-response rules
+  F_{a,b}, manipulation contrast ∆_{F,a}(·), pooled offline+online means for μ_ℓ and μ_f
+  (see hybrid_fmucb.py and Sec. 2 of the paper).
+- T_{f,w}: counts rounds where the follower deviates from the true best manipulation rule F^{fm},
+  not mere best-response error (paper Sec. 2 / Theorem 1).
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import matplotlib
 
@@ -20,6 +24,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
+
+from hybrid_fmucb import (
+    OfflineRewardStats,
+    hybrid_fmucb_pick,
+    true_best_manipulation,
+)
 
 # ---------------------------------------------------------------------------
 # Style
@@ -56,6 +66,7 @@ COLORS = {
     "hybrid": "#2E86AB",
     "good": "#3A7D44",
     "poor": "#A23B72",
+    "neutral": "#7D8590",
     "tabular": "#6B4E71",
     "contextual": "#2A9D8F",
 }
@@ -87,6 +98,7 @@ class StackelbergBandit:
     def n_b(self) -> int:
         return self.mu_leader.shape[1]
 
+    # Follower best response
     def follower_br(self, a: int) -> int:
         return int(np.argmax(self.mu_follower[a]))
 
@@ -95,27 +107,10 @@ class StackelbergBandit:
         vals = np.array([self.mu_leader[a, br[a]] for a in range(self.n_a)])
         return int(np.argmax(vals))
 
+    # Leader reward at the follower's best response
     def leader_reward_at_br(self, a: int) -> float:
         b = self.follower_br(a)
         return float(self.mu_leader[a, b])
-
-
-def follower_ucb_pick(
-    a: int,
-    n_visits: np.ndarray,
-    sum_r: np.ndarray,
-    t: int,
-    n_b: int,
-    rng: np.random.Generator,
-) -> int:
-    """UCB1 on μ_f(a,·) for fixed leader action a (vectorized over b)."""
-    na = np.maximum(1, n_visits[a].astype(np.float64))
-    mean = sum_r[a] / na
-    bonus = np.sqrt(2.0 * np.log(max(1, t)) / na)
-    ucb = mean + bonus
-    maxv = ucb.max()
-    cands = np.flatnonzero(np.isclose(ucb, maxv))
-    return int(rng.choice(cands))
 
 
 def exp3_sample(weights: np.ndarray, gamma: float, rng: np.random.Generator) -> int:
@@ -138,28 +133,50 @@ def exp3_update(
     weights[a] *= np.exp(gamma * r_hat / n)
 
 
+def _unpack_offline_init(
+    offline_init: Optional[Union[OfflineRewardStats, Tuple[np.ndarray, ...]]],
+    n_a: int,
+    n_b: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pooled offline counts and per-player reward sums (paper Sec. 2)."""
+    if offline_init is None:
+        return (
+            np.zeros((n_a, n_b), dtype=np.int64),
+            np.zeros((n_a, n_b), dtype=np.float64),
+            np.zeros((n_a, n_b), dtype=np.float64),
+        )
+    if isinstance(offline_init, OfflineRewardStats):
+        return offline_init.n_visits, offline_init.sum_r_f, offline_init.sum_r_l
+    n_visits = offline_init[0].astype(np.int64)
+    sum_r_f = offline_init[1].astype(np.float64)
+    sum_r_l = (
+        offline_init[2].astype(np.float64)
+        if len(offline_init) > 2
+        else np.zeros((n_a, n_b), dtype=np.float64)
+    )
+    return n_visits, sum_r_f, sum_r_l
+
+
 def simulate_run(
     env: StackelbergBandit,
     horizon: int,
     rng: np.random.Generator,
     *,
     gamma_exp3: float,
-    offline_init: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    offline_init: Optional[Union[OfflineRewardStats, Tuple[np.ndarray, ...]]] = None,
     reward_noise_std: float = 0.1,
 ) -> Dict[str, np.ndarray]:
     """
-    One FMUCB-style trajectory. Leader: EXP3 on observed leader rewards.
-    Follower: UCB on μ_f(a,·).
+    One trajectory: leader EXP3; follower tabular Hybrid-FMUCB (Algorithm 1, tabular).
 
-    offline_init: optional (n_visits, sum_r) warm-start from offline data.
+    Pooled means use N_off(a,b)+N_on_t(a,b) in numerator and denominator for both μ_ℓ and μ_f.
+    Offline init may be OfflineRewardStats or legacy (n_visits, sum_r_f) only — in the latter
+    case leader sums start at zero (online-only μ̂_ℓ).
+
+    ``subopt`` marks deviation from the true best manipulation rule F^{fm} (paper T_{f,w}).
     """
     n_a, n_b = env.n_a, env.n_b
-    n_visits = np.zeros((n_a, n_b), dtype=np.int64)
-    sum_r = np.zeros((n_a, n_b), dtype=np.float64)
-
-    if offline_init is not None:
-        n_visits += offline_init[0].astype(np.int64)
-        sum_r += offline_init[1]
+    n_visits, sum_r_f, sum_r_l = _unpack_offline_init(offline_init, n_a, n_b)
 
     weights = np.ones(n_a, dtype=np.float64)
 
@@ -170,11 +187,11 @@ def simulate_run(
 
     a_star = env.stackelberg_leader_action()
     opt_leader_payoff = env.leader_reward_at_br(a_star)
-    br_by_a = np.argmax(env.mu_follower, axis=1).astype(np.int32)
+    F_true, _ = true_best_manipulation(env.mu_leader, env.mu_follower)
 
     for t in range(1, horizon + 1):
         a = exp3_sample(weights, gamma_exp3, rng)
-        b = follower_ucb_pick(a, n_visits, sum_r, t, n_b, rng)
+        b = hybrid_fmucb_pick(a, n_visits, sum_r_f, sum_r_l, t, n_a, n_b, rng)
 
         r_l = env.mu_leader[a, b] + rng.normal(0.0, reward_noise_std)
         r_f = env.mu_follower[a, b] + rng.normal(0.0, reward_noise_std)
@@ -182,9 +199,10 @@ def simulate_run(
         exp3_update(weights, a, float(np.clip(r_l, 0.0, 1.0)), gamma_exp3)
 
         n_visits[a, b] += 1
-        sum_r[a, b] += r_f
+        sum_r_f[a, b] += r_f
+        sum_r_l[a, b] += r_l
 
-        subopt[t - 1] = b != br_by_a[a]
+        subopt[t - 1] = b != F_true[a]
 
         a_hist[t - 1] = a
         b_hist[t - 1] = b
@@ -202,75 +220,96 @@ def build_offline_uniform(
     env: StackelbergBandit,
     n_off: int,
     rng: np.random.Generator,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> OfflineRewardStats:
     n_a, n_b = env.n_a, env.n_b
     n_visits = np.zeros((n_a, n_b), dtype=np.int64)
-    sum_r = np.zeros((n_a, n_b), dtype=np.float64)
+    sum_r_f = np.zeros((n_a, n_b), dtype=np.float64)
+    sum_r_l = np.zeros((n_a, n_b), dtype=np.float64)
     for _ in range(n_off):
         a = int(rng.integers(0, n_a))
         b = int(rng.integers(0, n_b))
         r_f = env.mu_follower[a, b] + rng.normal(0.0, 0.1)
+        r_l = env.mu_leader[a, b] + rng.normal(0.0, 0.1)
         n_visits[a, b] += 1
-        sum_r[a, b] += r_f
-    return n_visits, sum_r
+        sum_r_f[a, b] += r_f
+        sum_r_l[a, b] += r_l
+    return OfflineRewardStats(n_visits=n_visits, sum_r_f=sum_r_f, sum_r_l=sum_r_l)
 
 
 def build_offline_good_coverage(
     env: StackelbergBandit,
     n_off: int,
     rng: np.random.Generator,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> OfflineRewardStats:
     """
-    Offline data biased toward decision-relevant pairs: each leader row's best response
-    and the Stackelberg pair, plus uniform mixing for diversity.
+    Includes the Stackelberg pair (a*, b*) often, but also many (a, BR(a)) for
+    random leader actions and uniform (a,b) draws. Heavy mass on only (a*, b*)
+    under-covers other rows and hurts the follower when EXP3 visits diverse a;
+    this mix matches “optimal region + broad coverage over leader actions.”
     """
     n_a, n_b = env.n_a, env.n_b
     n_visits = np.zeros((n_a, n_b), dtype=np.int64)
-    sum_r = np.zeros((n_a, n_b), dtype=np.float64)
+    sum_r_f = np.zeros((n_a, n_b), dtype=np.float64)
+    sum_r_l = np.zeros((n_a, n_b), dtype=np.float64)
     a_star = env.stackelberg_leader_action()
     b_star = env.follower_br(a_star)
 
     for _ in range(n_off):
         u = rng.random()
-        if u < 0.35:
+        if u < 0.4:
             a = a_star
             b = b_star
-        elif u < 0.75:
+        elif u < 0.8:
             a = int(rng.integers(0, n_a))
             b = env.follower_br(a)
         else:
             a = int(rng.integers(0, n_a))
             b = int(rng.integers(0, n_b))
         r_f = env.mu_follower[a, b] + rng.normal(0.0, 0.1)
+        r_l = env.mu_leader[a, b] + rng.normal(0.0, 0.1)
         n_visits[a, b] += 1
-        sum_r[a, b] += r_f
-    return n_visits, sum_r
+        sum_r_f[a, b] += r_f
+        sum_r_l[a, b] += r_l
+    return OfflineRewardStats(n_visits=n_visits, sum_r_f=sum_r_f, sum_r_l=sum_r_l)
 
 
 def build_offline_poor_coverage(
     env: StackelbergBandit,
     n_off: int,
     rng: np.random.Generator,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> OfflineRewardStats:
     """
-    Offline data avoids best-response pairs: only suboptimal b for each sampled a.
+    Offline data that **never** contains the Stackelberg pair (a*, b*): when
+    a = a*, sample b uniformly from B \\ {b*}; otherwise sample (a, b) uniformly.
+    This is a missing-optimal-region condition, not merely “negative examples”
+    (which can still be highly informative for elimination).
     """
     n_a, n_b = env.n_a, env.n_b
     n_visits = np.zeros((n_a, n_b), dtype=np.int64)
-    sum_r = np.zeros((n_a, n_b), dtype=np.float64)
+    sum_r_f = np.zeros((n_a, n_b), dtype=np.float64)
+    sum_r_l = np.zeros((n_a, n_b), dtype=np.float64)
+    a_star = env.stackelberg_leader_action()
+    b_star = env.follower_br(a_star)
 
     for _ in range(n_off):
         a = int(rng.integers(0, n_a))
-        br = env.follower_br(a)
-        others = [bb for bb in range(n_b) if bb != br]
-        if not others:
-            b = br
+        if a == a_star:
+            others = [bb for bb in range(n_b) if bb != b_star]
+            if others:
+                b = int(rng.choice(others))
+            else:
+                # n_b == 1: cannot exclude b*; resample a so the pair is not (a*, b*)
+                while a == a_star:
+                    a = int(rng.integers(0, n_a))
+                b = int(rng.integers(0, n_b))
         else:
-            b = int(rng.choice(others))
+            b = int(rng.integers(0, n_b))
         r_f = env.mu_follower[a, b] + rng.normal(0.0, 0.1)
+        r_l = env.mu_leader[a, b] + rng.normal(0.0, 0.1)
         n_visits[a, b] += 1
-        sum_r[a, b] += r_f
-    return n_visits, sum_r
+        sum_r_f[a, b] += r_f
+        sum_r_l[a, b] += r_l
+    return OfflineRewardStats(n_visits=n_visits, sum_r_f=sum_r_f, sum_r_l=sum_r_l)
 
 
 def convergence_round(
@@ -308,6 +347,36 @@ def ci_mean(
     return m, z * s
 
 
+def follower_subopt_rate_when_leader_a_star(
+    tr: Dict[str, np.ndarray],
+    env: StackelbergBandit,
+) -> float:
+    """
+    Fraction of rounds with manipulation mistakes (vs. true F^fm), among rounds with
+    leader action a* (Stackelberg leader action). Aligns with theory about
+    identifying optimal manipulation at a*; NaN if a* is never played.
+    """
+    a_star = int(env.stackelberg_leader_action())
+    a_hist = tr["a_hist"]
+    subopt = tr["subopt"]
+    mask = a_hist == a_star
+    if not np.any(mask):
+        return float("nan")
+    return float(subopt[mask].mean())
+
+
+def ci_mean_nan_1d(data: np.ndarray, z: float = 1.96) -> Tuple[float, float]:
+    """Mean and 95% CI half-width, ignoring non-finite values."""
+    x = data[np.isfinite(data)]
+    if x.size == 0:
+        return float("nan"), float("nan")
+    m = float(x.mean())
+    if x.size <= 1:
+        return m, 0.0
+    s = float(x.std(ddof=1)) / np.sqrt(x.size)
+    return m, z * s
+
+
 def experiment1(
     out_dir: str,
     seeds: Sequence[int],
@@ -324,6 +393,7 @@ def experiment1(
     if cum_target not in n_off_list:
         cum_target = max(n_off_list)
 
+    # We assume it converged if error rate ≤ 20% for 3 consecutive windows of 200 rounds
     conv_win = 200
     conv_thr = 0.2
     conv_k = 3
@@ -395,8 +465,8 @@ def experiment1(
     ax.set_xticks(x_plot)
     ax.set_xticklabels(x_labels)
     ax.set_xlabel(r"Offline dataset size $N_{\mathrm{off}}$")
-    ax.set_ylabel(r"$T_{f,w}$ (count of suboptimal follower plays)")
-    ax.set_title("Experiment 1: Offline data size vs follower suboptimality")
+    ax.set_ylabel(r"$T_{f,w}$ (mistakes vs.\ true best manipulation $F^{fm}$)")
+    ax.set_title(r"Experiment 1: Offline data size vs $T_{f,w}$")
     ax.legend(frameon=True, fancybox=True, shadow=True, loc="upper right")
     _style_axis(ax)
     fig.tight_layout()
@@ -442,7 +512,7 @@ def experiment1(
     ax.plot(t_axis, mch, "-", color=COLORS["hybrid"], lw=3, label="Hybrid-FMUCB")
     ax.fill_between(t_axis, mch - ech, mch + ech, color=COLORS["hybrid"], alpha=0.18)
     ax.set_xlabel("Round $t$")
-    ax.set_ylabel("Cumulative suboptimal follower plays")
+    ax.set_ylabel(r"Cumulative manipulation mistakes (vs.\ $F^{fm}$)")
     ax.set_title(
         rf"Experiment 1: Cumulative mistakes ($N_{{\mathrm{{off}}}}={cum_target}$)"
     )
@@ -481,44 +551,60 @@ def experiment2(
     n_off_fixed: int,
     progress: bool = True,
 ) -> None:
-    t_fw: Dict[str, np.ndarray] = {"good": [], "poor": []}
-    success: Dict[str, np.ndarray] = {"good": [], "poor": []}
+    kinds = ("good", "neutral", "poor")
+    t_fw: Dict[str, np.ndarray] = {k: np.zeros(len(seeds)) for k in kinds}
+    success: Dict[str, np.ndarray] = {k: np.zeros(len(seeds)) for k in kinds}
+    sub_at_star: Dict[str, np.ndarray] = {
+        k: np.full(len(seeds), np.nan, dtype=np.float64) for k in kinds
+    }
 
-    for kind in ("good", "poor"):
-        arr_t = np.zeros(len(seeds))
-        arr_s = np.zeros(len(seeds))
+    for kind in kinds:
         seed_bar = tqdm(
             seeds,
-            desc=f"Exp 2 ({kind} coverage)",
+            desc=f"Exp 2 ({kind})",
             unit="seed",
             disable=not progress,
         )
         for si, seed in enumerate(seed_bar):
             rng = np.random.default_rng(seed)
             env = StackelbergBandit.sample(n_a, n_b, rng)
-            rng_h = np.random.default_rng(seed + 91_000)
+            rng_off = np.random.default_rng(seed + 91_000)
+            rng_on = np.random.default_rng(seed + 92_000)
             if kind == "good":
-                off = build_offline_good_coverage(env, n_off_fixed, rng_h)
+                off = build_offline_good_coverage(env, n_off_fixed, rng_off)
+            elif kind == "neutral":
+                off = build_offline_uniform(env, n_off_fixed, rng_off)
             else:
-                off = build_offline_poor_coverage(env, n_off_fixed, rng_h)
-            tr = simulate_run(env, horizon, rng_h, gamma_exp3=gamma_exp3, offline_init=off)
-            arr_t[si] = tr["subopt"].sum()
-            # success: final-window follower optimality rate
+                off = build_offline_poor_coverage(env, n_off_fixed, rng_off)
+            tr = simulate_run(env, horizon, rng_on, gamma_exp3=gamma_exp3, offline_init=off)
+            t_fw[kind][si] = tr["subopt"].sum()
             w = min(500, horizon)
-            arr_s[si] = 1.0 - tr["subopt"][-w:].mean()
-        t_fw[kind] = arr_t
-        success[kind] = arr_s
+            success[kind][si] = 1.0 - tr["subopt"][-w:].mean()
+            sub_at_star[kind][si] = follower_subopt_rate_when_leader_a_star(tr, env)
 
-    # Bar chart with error bars
-    fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.8))
-    labels = ["Good coverage", "Poor coverage"]
-    colors_b = [COLORS["good"], COLORS["poor"]]
-    means_t = [t_fw["good"].mean(), t_fw["poor"].mean()]
-    errs_t = [
-        1.96 * t_fw["good"].std(ddof=1) / np.sqrt(len(seeds)),
-        1.96 * t_fw["poor"].std(ddof=1) / np.sqrt(len(seeds)),
+    labels = [
+        "Good (includes\n$(a^*, b^*)$)",
+        "Neutral\n(uniform)",
+        "Poor (never\n$(a^*, b^*)$)",
     ]
-    xpos = np.arange(2)
+    colors_b = [COLORS["good"], COLORS["neutral"], COLORS["poor"]]
+    means_t = [float(t_fw[k].mean()) for k in kinds]
+    errs_t = [
+        1.96 * t_fw[k].std(ddof=1) / np.sqrt(len(seeds)) for k in kinds
+    ]
+    means_s = [float(success[k].mean()) for k in kinds]
+    errs_s = [
+        1.96 * success[k].std(ddof=1) / np.sqrt(len(seeds)) for k in kinds
+    ]
+    means_star: List[float] = []
+    errs_star: List[float] = []
+    for k in kinds:
+        m, e = ci_mean_nan_1d(sub_at_star[k])
+        means_star.append(m)
+        errs_star.append(e)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18.0, 4.8))
+    xpos = np.arange(3)
     bars = axes[0].bar(
         xpos,
         means_t,
@@ -541,15 +627,39 @@ def experiment2(
         )
     axes[0].set_xticks(xpos)
     axes[0].set_xticklabels(labels)
-    axes[0].set_ylabel(r"$T_{f,w}$")
-    axes[0].set_title(rf"Total suboptimal follower plays ($N_{{\mathrm{{off}}}}={n_off_fixed}$)")
+    axes[0].set_ylabel(r"$T_{f,w}$ (vs.\ $F^{fm}$)")
+    axes[0].set_title(rf"Global: total $T_{{f,w}}$ ($N_{{\mathrm{{off}}}}={n_off_fixed}$)")
 
-    means_s = [success["good"].mean(), success["poor"].mean()]
-    errs_s = [
-        1.96 * success["good"].std(ddof=1) / np.sqrt(len(seeds)),
-        1.96 * success["poor"].std(ddof=1) / np.sqrt(len(seeds)),
-    ]
-    bars2 = axes[1].bar(
+    bars_m = axes[1].bar(
+        xpos,
+        means_star,
+        yerr=errs_star,
+        color=colors_b,
+        edgecolor="white",
+        linewidth=1.2,
+        capsize=6,
+        error_kw={"linewidth": 1.5},
+    )
+    emax = max(errs_star) if errs_star else 1.0
+    for rect, m in zip(bars_m, means_star):
+        if not np.isfinite(m):
+            continue
+        axes[1].text(
+            rect.get_x() + rect.get_width() / 2,
+            min(1.02, m + emax * 0.2 + 0.02),
+            f"{m:.2f}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+        )
+    axes[1].set_xticks(xpos)
+    axes[1].set_xticklabels(labels)
+    axes[1].set_ylim(0, 1.05)
+    axes[1].set_ylabel(r"Subopt. rate when $a_t=a^*$")
+    axes[1].set_title(r"Conditional on Stackelberg leader action (lower is better)")
+
+    bars2 = axes[2].bar(
         xpos,
         means_s,
         yerr=errs_s,
@@ -560,7 +670,7 @@ def experiment2(
         error_kw={"linewidth": 1.5},
     )
     for rect, m in zip(bars2, means_s):
-        axes[1].text(
+        axes[2].text(
             rect.get_x() + rect.get_width() / 2,
             min(1.02, m + max(errs_s) * 0.2 + 0.02),
             f"{m:.2f}",
@@ -569,18 +679,19 @@ def experiment2(
             fontsize=10,
             fontweight="bold",
         )
-    axes[1].set_xticks(xpos)
-    axes[1].set_xticklabels(labels)
-    axes[1].set_ylim(0, 1.05)
-    axes[1].set_ylabel("Success rate (final window)")
-    axes[1].set_title("Identification of optimal manipulation (higher is better)")
+    axes[2].set_xticks(xpos)
+    axes[2].set_xticklabels(labels)
+    axes[2].set_ylim(0, 1.05)
+    axes[2].set_ylabel("Success rate (final window)")
+    axes[2].set_title("Global: final-window optimality (higher is better)")
     fig.suptitle(
-        "Experiment 2: Coverage of offline data (fixed size)",
+        "Experiment 2: Global vs $a=a^*$ conditional metrics",
         fontsize=14,
         y=1.02,
     )
     _style_axis(axes[0])
     _style_axis(axes[1])
+    _style_axis(axes[2])
     fig.tight_layout()
     p = os.path.join(out_dir, "exp2_coverage_bars.png")
     fig.savefig(p, bbox_inches="tight")
@@ -590,10 +701,17 @@ def experiment2(
         json.dump(
             {
                 "n_off_fixed": n_off_fixed,
-                "tfw_good_mean": float(t_fw["good"].mean()),
-                "tfw_poor_mean": float(t_fw["poor"].mean()),
-                "success_good_mean": float(success["good"].mean()),
-                "success_poor_mean": float(success["poor"].mean()),
+                "good_coverage": "40pct_stackelberg_pair_40pct_br_uniform_a_20pct_uniform_ab",
+                "neutral_coverage": "uniform_ab",
+                "poor_coverage": "never_sample_stackelberg_pair_a_star_b_star_else_uniform",
+                "offline_rng_seed_offset": 91_000,
+                "online_rng_seed_offset": 92_000,
+                **{f"tfw_{k}_mean": float(t_fw[k].mean()) for k in kinds},
+                **{
+                    f"subopt_rate_at_a_star_{k}_mean": float(np.nanmean(sub_at_star[k]))
+                    for k in kinds
+                },
+                **{f"success_{k}_mean": float(success[k].mean()) for k in kinds},
             },
             f,
             indent=2,
@@ -647,7 +765,7 @@ def learning_curve_figure(
     ax.plot(t_axis, mh, color=COLORS["hybrid"], lw=2.0, label="Hybrid-FMUCB")
     ax.fill_between(t_axis, mh - eh, mh + eh, color=COLORS["hybrid"], alpha=0.2)
     ax.set_xlabel("Round $t$")
-    ax.set_ylabel(f"Rolling mean subopt. rate (window={win})")
+    ax.set_ylabel(f"Rolling mean manipulation-mistake rate (window={win})")
     ax.set_title(rf"Learning curves (optional): $N_{{\mathrm{{off}}}}={n_off}$")
     ax.legend(loc="upper right")
     ax.set_ylim(0, 1.0)
@@ -740,6 +858,10 @@ def simulate_contextual_tabular_hybrid(
     reward_noise_std: float,
     offline_init: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> np.ndarray:
+    """
+    Per-context UCB on μ_f (not full contextual Hybrid-FMUCB / Alg. 2).
+    ``subopt`` is best-response error, not manipulation-track F^{fm}.
+    """
     br = build_br_table(theta_f, n_x, n_a, n_b)
     n_visits = np.zeros((n_x, n_a, n_b), dtype=np.int64)
     sum_r = np.zeros((n_x, n_a, n_b), dtype=np.float64)
@@ -897,7 +1019,7 @@ def experiment3_contextual(
     )
     ax.set_xticks(xpos)
     ax.set_xticklabels(["Tabular Hybrid-FMUCB", "Contextual Hybrid-FMUCB (LinUCB)"])
-    ax.set_ylabel(r"$T_{f,w}$ (suboptimal follower plays)")
+    ax.set_ylabel(r"Follower error count (not $F^{fm}$; BR subopt.)")
     ax.set_title(
         rf"Experiment 3 (optional): contextual extension ($N_{{\mathrm{{off}}}}={n_off}$, "
         rf"$|X|={n_x}$, $|A|={n_a}$, $|B|={n_b}$)"
