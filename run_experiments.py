@@ -309,6 +309,37 @@ def ci_mean_nan_1d(data: np.ndarray, z: float = 1.96) -> Tuple[float, float]:
     return m, z * float(x.std(ddof=1)) / np.sqrt(x.size)
 
 
+def ci_mean_nan(
+    data: np.ndarray, axis: int = 0, z: float = 1.96
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Mean and ~95% CI row-wise, ignoring NaNs (effective n varies)."""
+    m = np.nanmean(data, axis=axis)
+    valid = np.sum(np.isfinite(data), axis=axis).astype(np.float64)
+    valid = np.maximum(valid, 1.0)
+    std = np.nanstd(data, axis=axis, ddof=1)
+    std = np.where(np.isfinite(std), std, 0.0)
+    se = std / np.sqrt(valid)
+    return m, z * se
+
+
+def rolling_subopt_rate_at_a_star(
+    subopt: np.ndarray,
+    a_hist: np.ndarray,
+    a_star: int,
+    window: int,
+) -> np.ndarray:
+    """Rolling mean subopt over rounds in each window with `a_t=a^*` (NaN if none)."""
+    n = len(subopt)
+    if n < window:
+        return np.array([], dtype=np.float64)
+    out = np.empty(n - window + 1, dtype=np.float64)
+    for i in range(n - window + 1):
+        sub = subopt[i : i + window]
+        m = a_hist[i : i + window] == a_star
+        out[i] = np.nan if not np.any(m) else float(sub[m].mean())
+    return out
+
+
 def follower_subopt_rate_at_a_star(
     tr: Dict[str, np.ndarray], env: StackelbergBandit
 ) -> float:
@@ -325,6 +356,7 @@ def experiment1(
     out_dir: str, seeds: Sequence[int], n_a: int, n_b: int,
     horizon: int, gamma_exp3: float, n_off_grid: Sequence[int],
     cum_n_off: Optional[int] = None, progress: bool = True,
+    delta: float = 0.05,
 ) -> None:
     n_off_list = list(n_off_grid)
     cum_target = (max(n_off_list) if cum_n_off is None else cum_n_off)
@@ -348,8 +380,10 @@ def experiment1(
             rng_b = np.random.default_rng(seed * 100_000 + j + 7)
             rng_h = np.random.default_rng(seed * 100_000 + j + 13)
             off = build_offline_uniform(env, n_off, rng_b) if n_off > 0 else None
-            tr_b = simulate_run(env, horizon, rng_b, gamma_exp3=gamma_exp3)
-            tr_h = simulate_run(env, horizon, rng_h, gamma_exp3=gamma_exp3, offline_init=off)
+            tr_b = simulate_run(env, horizon, rng_b, gamma_exp3=gamma_exp3, delta=delta)
+            tr_h = simulate_run(
+                env, horizon, rng_h, gamma_exp3=gamma_exp3, offline_init=off, delta=delta
+            )
             t_fw_base[si, j] = tr_b["subopt"].sum()
             t_fw_hyb[si, j] = tr_h["subopt"].sum()
             conv_base[si, j] = convergence_round(tr_b["subopt"], conv_win, conv_thr, conv_k)
@@ -420,6 +454,8 @@ def experiment1(
             "n_off": n_off_list,
             "reward_model": "Bernoulli",
             "confidence_sets": "regression_Hoeffding",
+            "confidence_delta": delta,
+            "gamma_exp3": gamma_exp3,
             "tfw_baseline_mean": t_fw_base.mean(0).tolist(),
             "tfw_hybrid_mean": t_fw_hyb.mean(0).tolist(),
             "convergence_baseline_mean": conv_base.mean(0).tolist(),
@@ -434,6 +470,7 @@ def experiment1(
 def experiment2(
     out_dir: str, seeds: Sequence[int], n_a: int, n_b: int,
     horizon: int, gamma_exp3: float, n_off_fixed: int, progress: bool = True,
+    delta: float = 0.05,
 ) -> None:
     kinds = ("good", "neutral", "poor")
     t_fw = {k: np.zeros(len(seeds)) for k in kinds}
@@ -454,7 +491,9 @@ def experiment2(
                 "poor": build_offline_poor_coverage,
             }
             off = builders[kind](env, n_off_fixed, rng_off)
-            tr = simulate_run(env, horizon, rng_on, gamma_exp3=gamma_exp3, offline_init=off)
+            tr = simulate_run(
+                env, horizon, rng_on, gamma_exp3=gamma_exp3, offline_init=off, delta=delta
+            )
             t_fw[kind][si] = tr["subopt"].sum()
             success[kind][si] = 1.0 - tr["subopt"][-min(500, horizon):].mean()
             sub_at_star[kind][si] = follower_subopt_rate_at_a_star(tr, env)
@@ -507,32 +546,108 @@ def experiment2(
 # ---------------------------------------------------------------------------
 
 def learning_curve_figure(
-    out_dir: str, seeds: Sequence[int], n_a: int, n_b: int,
-    horizon: int, gamma_exp3: float, n_off: int, progress: bool = True,
+    out_dir: str,
+    seeds: Sequence[int],
+    n_a: int,
+    n_b: int,
+    horizon: int,
+    gamma_exp3: float,
+    n_off: int,
+    progress: bool = True,
+    rolling_window: Optional[int] = None,
+    delta: float = 0.05,
+    caption_suffix: str = "",
 ) -> None:
-    curves_b: List[np.ndarray] = []; curves_h: List[np.ndarray] = []
-    win = max(50, horizon // 100)
+    """
+    Rolling **global** mistake rate vs time (subopt averaged over all rounds in the window).
+
+    Paper context (*Hybrid Offline-Online Follower Manipulation...*): $T_{f,w}$ aggregates
+    rounds where $b_t \\neq F^{fm}(a_t)$. The theory emphasizes **qualified manipulation**
+    at the target and hybrid **sample complexity** (via $C_{\\mathrm{man}}$), not a monotone
+    global error curve. EXP3 explores all leader rows, so the global rolling rate can stay high
+    even when behavior at the Stackelberg row $a^*$ improves — see
+    ``exp_optional_learning_curves_at_a_star.png``. For stronger global trends without changing
+    Alg. 1, use smaller $\\gamma$, longer $T$, more offline data (CLI: ``--learning-curve-paper-profile``).
+    """
+    curves_b: List[np.ndarray] = []
+    curves_h: List[np.ndarray] = []
+    curves_b_as: List[np.ndarray] = []
+    curves_h_as: List[np.ndarray] = []
+    win = rolling_window if rolling_window is not None else max(50, horizon // 100)
+    win = min(int(win), max(1, horizon))
+    fb_hybrid_total = 0
     for seed in tqdm(seeds, desc="Learning curves", unit="seed", disable=not progress):
         rng = np.random.default_rng(seed)
         env = StackelbergBandit.sample(n_a, n_b, rng)
-        rng_b = np.random.default_rng(seed + 3); rng_h = np.random.default_rng(seed + 5)
+        a_star_env = int(env.stackelberg_leader_action())
+        rng_b = np.random.default_rng(seed + 3)
+        rng_h = np.random.default_rng(seed + 5)
         off = build_offline_uniform(env, n_off, rng_h) if n_off > 0 else None
-        tr_b = simulate_run(env, horizon, rng_b, gamma_exp3=gamma_exp3)
-        tr_h = simulate_run(env, horizon, rng_h, gamma_exp3=gamma_exp3, offline_init=off)
-        curves_b.append(np.convolve(tr_b["subopt"].astype(float), np.ones(win) / win, "valid"))
-        curves_h.append(np.convolve(tr_h["subopt"].astype(float), np.ones(win) / win, "valid"))
+        tr_b = simulate_run(env, horizon, rng_b, gamma_exp3=gamma_exp3, delta=delta)
+        tr_h = simulate_run(
+            env, horizon, rng_h, gamma_exp3=gamma_exp3, offline_init=off, delta=delta
+        )
+        fb_hybrid_total += int(tr_h.get("fallback_count", 0))
+
+        sub_b = tr_b["subopt"].astype(float)
+        sub_h = tr_h["subopt"].astype(float)
+        curves_b.append(np.convolve(sub_b, np.ones(win) / win, mode="valid"))
+        curves_h.append(np.convolve(sub_h, np.ones(win) / win, mode="valid"))
+        curves_b_as.append(
+            rolling_subopt_rate_at_a_star(sub_b, tr_b["a_hist"], a_star_env, win)
+        )
+        curves_h_as.append(
+            rolling_subopt_rate_at_a_star(sub_h, tr_h["a_hist"], a_star_env, win)
+        )
+
     t_axis = np.arange(win, horizon + 1)
-    mb, eb = ci_mean(np.stack(curves_b)); mh, eh = ci_mean(np.stack(curves_h))
+    mb, eb = ci_mean(np.stack(curves_b))
+    mh, eh = ci_mean(np.stack(curves_h))
     fig, ax = plt.subplots(figsize=(9.0, 5.0))
     ax.plot(t_axis, mb, color=COLORS["baseline"], lw=2, label="FMUCB")
     ax.fill_between(t_axis, mb - eb, mb + eb, color=COLORS["baseline"], alpha=0.2)
     ax.plot(t_axis, mh, color=COLORS["hybrid"], lw=2, label="Hybrid-FMUCB")
     ax.fill_between(t_axis, mh - eh, mh + eh, color=COLORS["hybrid"], alpha=0.2)
-    ax.set_xlabel("Round $t$"); ax.set_ylabel(f"Rolling subopt. rate (window={win})")
-    ax.set_title(rf"Learning curves: $N_{{\mathrm{{off}}}}={n_off}$")
-    ax.legend(); ax.set_ylim(0, 1.0); _style_axis(ax); fig.tight_layout()
+    ax.set_xlabel("Round $t$")
+    ax.set_ylabel(f"Rolling subopt. rate (window={win})")
+    fb_rate = fb_hybrid_total / max(1, len(seeds) * horizon)
+    ax.set_title(
+        rf"Learning curves (global): $N_{{\mathrm{{off}}}}={n_off}$ — "
+        f"hybrid row-fallback fraction ≈ {fb_rate:.3f} per round (mean over seeds)"
+        + caption_suffix
+    )
+    ax.legend()
+    ax.set_ylim(0, 1.0)
+    _style_axis(ax)
+    fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "exp_optional_learning_curves.png"), bbox_inches="tight")
     plt.close(fig)
+
+    stack_b_as = np.stack(curves_b_as, axis=0)
+    stack_h_as = np.stack(curves_h_as, axis=0)
+    mb_a, eb_a = ci_mean_nan(stack_b_as, axis=0)
+    mh_a, eh_a = ci_mean_nan(stack_h_as, axis=0)
+    fig_a, ax_a = plt.subplots(figsize=(9.0, 5.0))
+    ax_a.plot(t_axis, mb_a, color=COLORS["baseline"], lw=2, label="FMUCB")
+    ax_a.fill_between(t_axis, mb_a - eb_a, mb_a + eb_a, color=COLORS["baseline"], alpha=0.2)
+    ax_a.plot(t_axis, mh_a, color=COLORS["hybrid"], lw=2, label="Hybrid-FMUCB")
+    ax_a.fill_between(t_axis, mh_a - eh_a, mh_a + eh_a, color=COLORS["hybrid"], alpha=0.2)
+    ax_a.set_xlabel("Round $t$")
+    ax_a.set_ylabel(f"Rolling subopt. at $a_t=a^*$ (window={win})")
+    ax_a.set_title(
+        rf"Learning curves (paper-relevant): conditional on Stackelberg leader row "
+        rf"($N_{{\mathrm{{off}}}}={n_off}$)"
+        + caption_suffix
+    )
+    ax_a.legend()
+    ax_a.set_ylim(0, 1.0)
+    _style_axis(ax_a)
+    fig_a.tight_layout()
+    fig_a.savefig(
+        os.path.join(out_dir, "exp_optional_learning_curves_at_a_star.png"),
+        bbox_inches="tight",
+    )
+    plt.close(fig_a)
 
 
 # ===========================================================================
@@ -936,7 +1051,18 @@ def main() -> None:
     parser.add_argument("--n-a", type=int, default=8)
     parser.add_argument("--n-b", type=int, default=8)
     parser.add_argument("--horizon", type=int, default=8000)
-    parser.add_argument("--gamma-exp3", type=float, default=0.05)
+    parser.add_argument(
+        "--gamma-exp3",
+        type=float,
+        default=0.01,
+        help=r"EXP3 exploration $\gamma$ (smaller ⇒ more weight on leader actions with high empirical payoff; typical 0.05–0.01)",
+    )
+    parser.add_argument(
+        "--confidence-delta",
+        type=float,
+        default=0.05,
+        help="High-probability parameter for regression confidence sets in Alg. 1 (finite-sample bounds; unchanged from implementation default)",
+    )
     parser.add_argument("--exp1-cum-n-off", type=int, default=None)
     parser.add_argument("--exp2-n-off", type=int, default=1000)
     parser.add_argument("--skip-learning-curves", action="store_true")
@@ -959,6 +1085,41 @@ def main() -> None:
     parser.add_argument("--exp3-n-off", type=int, default=1500)
     parser.add_argument("--n-x", type=int, default=5)
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument(
+        "--learning-curve-horizon",
+        type=int,
+        default=None,
+        help="Learning-curve online length (default: same as --horizon; use e.g. 1500 for quick tests)",
+    )
+    parser.add_argument(
+        "--learning-curve-seeds",
+        type=int,
+        default=None,
+        help="Number of seeds for learning curves only (default: same as --seeds)",
+    )
+    parser.add_argument(
+        "--learning-curve-n-off",
+        type=int,
+        default=1000,
+        help="Offline size for learning-curve runs",
+    )
+    parser.add_argument(
+        "--learning-curve-window",
+        type=int,
+        default=None,
+        help="Rolling window length (default: max(50, horizon_lc//100))",
+    )
+    parser.add_argument(
+        "--learning-curve-gamma-exp3",
+        type=float,
+        default=None,
+        help="EXP3 gamma for learning curves only (default: same as --gamma-exp3). Use e.g. 0.005 for more visits to a* in LC plots.",
+    )
+    parser.add_argument(
+        "--learning-curve-paper-profile",
+        action="store_true",
+        help="Learning curves: use longer online horizon (max 20k vs --horizon), cap gamma at 0.01, floor N_off at 3000 — same Alg 1, stronger global signal",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -998,6 +1159,7 @@ def main() -> None:
             n_off_grid,
             cum_n_off=args.exp1_cum_n_off,
             progress=show_p,
+            delta=args.confidence_delta,
         )
     if run_exp2:
         experiment2(
@@ -1009,17 +1171,48 @@ def main() -> None:
             args.gamma_exp3,
             args.exp2_n_off,
             progress=show_p,
+            delta=args.confidence_delta,
         )
     if run_lc:
+        lc_horizon = (
+            args.learning_curve_horizon
+            if args.learning_curve_horizon is not None
+            else args.horizon
+        )
+        lc_n = (
+            args.learning_curve_seeds
+            if args.learning_curve_seeds is not None
+            else args.seeds
+        )
+        lc_seeds = [args.base_seed + i for i in range(lc_n)]
+        lc_gamma = (
+            args.learning_curve_gamma_exp3
+            if args.learning_curve_gamma_exp3 is not None
+            else args.gamma_exp3
+        )
+        lc_n_off = args.learning_curve_n_off
+        lc_caption = ""
+        if args.learning_curve_paper_profile:
+            if args.learning_curve_horizon is None:
+                lc_horizon = max(20000, args.horizon)
+            lc_gamma = min(lc_gamma, 0.01)
+            lc_n_off = max(lc_n_off, 3000)
+            lc_caption = (
+                rf" — paper-profile: $T={lc_horizon}$, "
+                rf"$\gamma={lc_gamma}$, $N_{{\mathrm{{off}}}}={lc_n_off}$"
+            )
         learning_curve_figure(
             args.out_dir,
-            seeds,
+            lc_seeds,
             args.n_a,
             args.n_b,
-            args.horizon,
-            args.gamma_exp3,
-            n_off=1000,
+            lc_horizon,
+            lc_gamma,
+            n_off=lc_n_off,
             progress=show_p,
+            rolling_window=args.learning_curve_window,
+            delta=args.confidence_delta,
+            caption_suffix=lc_caption,
         )
     if args.exp3:
         experiment3_contextual(args.out_dir, seeds, args.horizon, args.gamma_exp3,
