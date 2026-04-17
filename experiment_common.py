@@ -17,6 +17,8 @@ from hybrid_fmucb import (
     LeaderFeasibility,
     OfflineRewardStats,
     hybrid_fmucb_pick,
+    offline_candidate_manipulation,
+    theorem1_offline_transfer_check,
     true_best_manipulation,
 )
 
@@ -158,6 +160,26 @@ def simulate_run(
     n_a, n_b = env.n_a, env.n_b
     n_visits, sum_r_f, sum_r_l = _unpack_offline_init(offline_init, n_a, n_b)
 
+    offline_m0_nonempty = np.array([np.nan])
+    theorem1_transfer_ok = np.array([np.nan])
+    theorem1_transfer_lhs = np.array([np.nan])
+    theorem1_transfer_threshold = np.array([np.nan])
+    theorem1_delta3 = np.array([np.nan])
+    if offline_init is not None:
+        eps_base = follower_elim_eps if follower_elim_eps is not None else 1e-9
+        eps_eff = float(eps_base) + float(feasibility_margin)
+        cand_F, _, _, _ = offline_candidate_manipulation(
+            sum_r_l, sum_r_f, n_visits, n_a, n_b, 0.05, eps=eps_eff
+        )
+        offline_m0_nonempty = np.array([1.0 if cand_F is not None else 0.0])
+        ok, lhs, thr, d3 = theorem1_offline_transfer_check(
+            env.mu_leader, env.mu_follower, n_visits, sum_r_l, n_a, n_b
+        )
+        theorem1_transfer_ok = np.array([1.0 if ok else 0.0])
+        theorem1_transfer_lhs = np.array([lhs])
+        theorem1_transfer_threshold = np.array([thr])
+        theorem1_delta3 = np.array([d3])
+
     weights = np.ones(n_a, dtype=np.float64)
 
     a_hist = np.zeros(horizon, dtype=np.int32)
@@ -171,7 +193,7 @@ def simulate_run(
 
     for t in range(1, horizon + 1):
         a = exp3_sample(weights, gamma_exp3, rng)
-        b = hybrid_fmucb_pick(
+        b, _ = hybrid_fmucb_pick(
             a,
             n_visits,
             sum_r_f,
@@ -205,6 +227,11 @@ def simulate_run(
         "a_hist": a_hist,
         "b_hist": b_hist,
         "leader_regret_inst": leader_regret_inst,
+        "offline_m0_nonempty": offline_m0_nonempty,
+        "theorem1_transfer_ok": theorem1_transfer_ok,
+        "theorem1_transfer_lhs": theorem1_transfer_lhs,
+        "theorem1_transfer_threshold": theorem1_transfer_threshold,
+        "theorem1_delta3": theorem1_delta3,
     }
 
 

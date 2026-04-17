@@ -93,6 +93,8 @@ Learning-curve–specific: `--learning-curve-horizon`, `--learning-curve-seeds`,
 
 **What they do:** Rolling **global** mistake rate vs time, plus a **conditional** curve restricted to rounds with \(a_t = a^*\) (Stackelberg leader row), which is often easier to interpret than the global average when EXP3 visits many rows.
 
+**Why the global curve can look almost flat (especially in short smoke tests):** The leader runs **EXP3** and keeps positive probability on every row, so most rounds use \(a_t \neq a^*\). Suboptimality is measured vs \(F^{\mathrm{fm}}(a_t)\), which mixes many rows—so the **global** rolling rate often decreases slowly or not at all even when the follower learns well on the Stackelberg row. Use **`exp_optional_learning_curves_at_a_star.png`** for the theory-relevant trend; for a stronger **global** downward slope (same Alg. 1), try longer \(T\), more \(N_{\mathrm{off}}\), smaller \(\gamma\), or `--learning-curve-paper-profile`.
+
 **Outputs:** `exp_optional_learning_curves.png`, `exp_optional_learning_curves_at_a_star.png`.
 
 ---

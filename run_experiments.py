@@ -6,8 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+
+# stderr is unbuffered on most platforms; stdout may wait until first newline
+print("run_experiments: importing numpy/matplotlib…", file=sys.stderr, flush=True)
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -18,12 +22,12 @@ from tqdm import tqdm
 from hybrid_fmucb import (
     OfflineRewardStats,
     build_rule_F,
-    certify_offline,
-    compute_c_man,
     hybrid_fmucb_pick,
     manipulation_contrast,
+    offline_candidate_manipulation,
     pooled_mean,
     regression_confidence_radius,
+    theorem1_offline_transfer_check,
     true_best_manipulation,
 )
 
@@ -217,6 +221,8 @@ def simulate_run(
     gamma_exp3: float,
     offline_init: Optional[OfflineRewardStats] = None,
     delta: float = 0.05,
+    progress_rounds: bool = False,
+    progress_desc: str = "round",
 ) -> Dict[str, np.ndarray]:
     """
     One trajectory: leader EXP3, follower tabular Hybrid-FMUCB (Algorithm 1).
@@ -224,6 +230,8 @@ def simulate_run(
     Rewards are Bernoulli: r_l ~ Ber(mu_l(a,b)), r_f ~ Ber(mu_f(a,b)).
     Confidence sets use regression_confidence_radius (Deviation 2).
     T_{f,w} = sum_t 1{b_t != F^fm(a_t)}.
+
+    Set ``progress_rounds=True`` for a per-round tqdm bar (e.g. learning-curve runs).
     """
     n_a, n_b = env.n_a, env.n_b
     n_visits, sum_r_f, sum_r_l = _unpack_offline(offline_init, n_a, n_b)
@@ -231,13 +239,42 @@ def simulate_run(
     F_true, _ = true_best_manipulation(env.mu_leader, env.mu_follower)
     opt_payoff = env.leader_reward_at_br(env.stackelberg_leader_action())
 
+    offline_m0_nonempty = np.array([np.nan])
+    theorem1_transfer_ok = np.array([np.nan])
+    theorem1_transfer_lhs = np.array([np.nan])
+    theorem1_transfer_threshold = np.array([np.nan])
+    theorem1_delta3 = np.array([np.nan])
+    if offline_init is not None:
+        cand_F, _, _, _ = offline_candidate_manipulation(
+            sum_r_l, sum_r_f, n_visits, n_a, n_b, delta
+        )
+        offline_m0_nonempty = np.array([1.0 if cand_F is not None else 0.0])
+        ok, lhs, thr, d3 = theorem1_offline_transfer_check(
+            env.mu_leader, env.mu_follower, n_visits, sum_r_l, n_a, n_b
+        )
+        theorem1_transfer_ok = np.array([1.0 if ok else 0.0])
+        theorem1_transfer_lhs = np.array([lhs])
+        theorem1_transfer_threshold = np.array([thr])
+        theorem1_delta3 = np.array([d3])
+
     a_hist = np.zeros(horizon, dtype=np.int32)
     b_hist = np.zeros(horizon, dtype=np.int32)
     subopt = np.zeros(horizon, dtype=np.bool_)
     leader_regret = np.zeros(horizon)
     fallback_count = 0
 
-    for t in range(1, horizon + 1):
+    if progress_rounds:
+        round_iter = tqdm(
+            range(1, horizon + 1),
+            desc=progress_desc,
+            leave=False,
+            unit="t",
+            total=horizon,
+            mininterval=0.25,
+        )
+    else:
+        round_iter = range(1, horizon + 1)
+    for t in round_iter:
         a = exp3_sample(weights, gamma_exp3, rng)
         b, used_fallback = hybrid_fmucb_pick(
             a, n_visits, sum_r_f, sum_r_l, t, n_a, n_b, rng, delta=delta
@@ -265,6 +302,11 @@ def simulate_run(
         "b_hist": b_hist,
         "leader_regret": leader_regret,
         "fallback_count": fallback_count,
+        "offline_m0_nonempty": offline_m0_nonempty,
+        "theorem1_transfer_ok": theorem1_transfer_ok,
+        "theorem1_transfer_lhs": theorem1_transfer_lhs,
+        "theorem1_transfer_threshold": theorem1_transfer_threshold,
+        "theorem1_delta3": theorem1_delta3,
     }
 
 
@@ -370,13 +412,26 @@ def experiment1(
     conv_hyb = np.zeros((len(seeds), len(n_off_list)))
     cum_base_rows: List[np.ndarray] = []
     cum_hyb_rows: List[np.ndarray] = []
+    thm1_transfer_hybrid = np.full((len(seeds), len(n_off_list)), np.nan)
+    offline_m0_hybrid = np.full((len(seeds), len(n_off_list)), np.nan)
 
     for si, seed in enumerate(
         tqdm(seeds, desc="Exp 1", unit="seed", disable=not progress)
     ):
         rng = np.random.default_rng(seed)
         env = StackelbergBandit.sample(n_a, n_b, rng)
-        for j, n_off in enumerate(n_off_list):
+        # Inner bar: each cell is 2×horizon (baseline + hybrid); outer "Exp 1" seed bar
+        # only moves after all N_off grid points for that seed finish.
+        n_off_indices = range(len(n_off_list))
+        if progress:
+            n_off_indices = tqdm(
+                n_off_indices,
+                desc=f"Exp1 seed {seed} N_off",
+                leave=False,
+                unit="cell",
+            )
+        for j in n_off_indices:
+            n_off = n_off_list[j]
             rng_b = np.random.default_rng(seed * 100_000 + j + 7)
             rng_h = np.random.default_rng(seed * 100_000 + j + 13)
             off = build_offline_uniform(env, n_off, rng_b) if n_off > 0 else None
@@ -384,6 +439,9 @@ def experiment1(
             tr_h = simulate_run(
                 env, horizon, rng_h, gamma_exp3=gamma_exp3, offline_init=off, delta=delta
             )
+            if n_off > 0:
+                thm1_transfer_hybrid[si, j] = float(tr_h["theorem1_transfer_ok"][0])
+                offline_m0_hybrid[si, j] = float(tr_h["offline_m0_nonempty"][0])
             t_fw_base[si, j] = tr_b["subopt"].sum()
             t_fw_hyb[si, j] = tr_h["subopt"].sum()
             conv_base[si, j] = convergence_round(tr_b["subopt"], conv_win, conv_thr, conv_k)
@@ -460,6 +518,12 @@ def experiment1(
             "tfw_hybrid_mean": t_fw_hyb.mean(0).tolist(),
             "convergence_baseline_mean": conv_base.mean(0).tolist(),
             "convergence_hybrid_mean": conv_hyb.mean(0).tolist(),
+            "theorem1_offline_transfer_rate_hybrid_mean": np.nanmean(
+                thm1_transfer_hybrid, axis=0
+            ).tolist(),
+            "offline_m0_nonempty_rate_hybrid_mean": np.nanmean(
+                offline_m0_hybrid, axis=0
+            ).tolist(),
         }, f, indent=2)
 
 
@@ -492,7 +556,14 @@ def experiment2(
             }
             off = builders[kind](env, n_off_fixed, rng_off)
             tr = simulate_run(
-                env, horizon, rng_on, gamma_exp3=gamma_exp3, offline_init=off, delta=delta
+                env,
+                horizon,
+                rng_on,
+                gamma_exp3=gamma_exp3,
+                offline_init=off,
+                delta=delta,
+                progress_rounds=progress,
+                progress_desc=f"Exp2 {kind} {seed}",
             )
             t_fw[kind][si] = tr["subopt"].sum()
             success[kind][si] = 1.0 - tr["subopt"][-min(500, horizon):].mean()
@@ -576,6 +647,12 @@ def learning_curve_figure(
     win = rolling_window if rolling_window is not None else max(50, horizon // 100)
     win = min(int(win), max(1, horizon))
     fb_hybrid_total = 0
+    if progress:
+        print(
+            f"Learning curves: {len(seeds)} seeds, horizon={horizon}, N_off={n_off} "
+            f"(per-round tqdm inside each simulate_run; outer bar = seeds).",
+            flush=True,
+        )
     for seed in tqdm(seeds, desc="Learning curves", unit="seed", disable=not progress):
         rng = np.random.default_rng(seed)
         env = StackelbergBandit.sample(n_a, n_b, rng)
@@ -583,9 +660,24 @@ def learning_curve_figure(
         rng_b = np.random.default_rng(seed + 3)
         rng_h = np.random.default_rng(seed + 5)
         off = build_offline_uniform(env, n_off, rng_h) if n_off > 0 else None
-        tr_b = simulate_run(env, horizon, rng_b, gamma_exp3=gamma_exp3, delta=delta)
+        tr_b = simulate_run(
+            env,
+            horizon,
+            rng_b,
+            gamma_exp3=gamma_exp3,
+            delta=delta,
+            progress_rounds=progress,
+            progress_desc=f"LC seed {seed} baseline",
+        )
         tr_h = simulate_run(
-            env, horizon, rng_h, gamma_exp3=gamma_exp3, offline_init=off, delta=delta
+            env,
+            horizon,
+            rng_h,
+            gamma_exp3=gamma_exp3,
+            offline_init=off,
+            delta=delta,
+            progress_rounds=progress,
+            progress_desc=f"LC seed {seed} hybrid",
         )
         fb_hybrid_total += int(tr_h.get("fallback_count", 0))
 
@@ -615,6 +707,8 @@ def learning_curve_figure(
         rf"Learning curves (global): $N_{{\mathrm{{off}}}}={n_off}$ — "
         f"hybrid row-fallback fraction ≈ {fb_rate:.3f} per round (mean over seeds)"
         + caption_suffix
+        + "\n"
+        + r"(EXP3 visits all leader rows; global rolling error often stays high — compare the $a_t=a^*$ plot.)"
     )
     ax.legend()
     ax.set_ylim(0, 1.0)
@@ -1042,6 +1136,10 @@ def experiment3_contextual(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # py3.7+: show prints immediately
+    except (AttributeError, OSError):
+        pass
     parser = argparse.ArgumentParser(
         description="Stackelberg bandit offline-online experiments"
     )
@@ -1148,6 +1246,23 @@ def main() -> None:
         run_exp2 = True
         run_lc = not args.skip_learning_curves
 
+    if show_p:
+        parts: List[str] = []
+        if run_exp1:
+            parts.append("exp1")
+        if run_exp2:
+            parts.append("exp2")
+        if run_lc:
+            parts.append("learning curves")
+        if args.exp3:
+            parts.append("exp3")
+        msg = (
+            f"Starting: {', '.join(parts)} | seeds={args.seeds} horizon={args.horizon} "
+            f"n_a={args.n_a} n_b={args.n_b} — exp1: {len(n_off_grid)} N_off cells × "
+            f"2 rollouts × {args.horizon} steps (per-round tqdm when progress is on)."
+        )
+        print(msg, file=sys.stderr, flush=True)
+
     if run_exp1:
         experiment1(
             args.out_dir,
@@ -1218,7 +1333,7 @@ def main() -> None:
         experiment3_contextual(args.out_dir, seeds, args.horizon, args.gamma_exp3,
                                args.exp3_n_off, args.n_x, args.n_a, args.n_b,
                                progress=show_p)
-    print(f"Wrote figures to {os.path.abspath(args.out_dir)}")
+    print(f"Wrote figures to {os.path.abspath(args.out_dir)}", flush=True)
 
 
 if __name__ == "__main__":

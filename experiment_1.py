@@ -44,6 +44,8 @@ def experiment1(
     conv_hyb = np.zeros((len(seeds), len(n_off_list)))
     cum_base_rows: List[np.ndarray] = []
     cum_hyb_rows: List[np.ndarray] = []
+    thm1_transfer_hybrid = np.full((len(seeds), len(n_off_list)), np.nan)
+    offline_m0_hybrid = np.full((len(seeds), len(n_off_list)), np.nan)
 
     for si, seed in enumerate(
         tqdm(seeds, desc="Exp 1 (offline size × seeds)", unit="seed", disable=not progress)
@@ -83,6 +85,10 @@ def experiment1(
                 leader_feasibility=leader_feasibility,
                 feasibility_margin=feasibility_margin,
             )
+
+            if n_off > 0:
+                thm1_transfer_hybrid[si, j] = float(tr_h["theorem1_transfer_ok"][0])
+                offline_m0_hybrid[si, j] = float(tr_h["offline_m0_nonempty"][0])
 
             t_fw_base[si, j] = tr_b["subopt"].sum()
             t_fw_hyb[si, j] = tr_h["subopt"].sum()
@@ -191,6 +197,12 @@ def experiment1(
         "tfw_hybrid_mean": t_fw_hyb.mean(0).tolist(),
         "convergence_baseline_mean": conv_base.mean(0).tolist(),
         "convergence_hybrid_mean": conv_hyb.mean(0).tolist(),
+        "theorem1_offline_transfer_rate_hybrid_mean": np.nanmean(
+            thm1_transfer_hybrid, axis=0
+        ).tolist(),
+        "offline_m0_nonempty_rate_hybrid_mean": np.nanmean(
+            offline_m0_hybrid, axis=0
+        ).tolist(),
     }
     with open(os.path.join(out_dir, "exp1_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

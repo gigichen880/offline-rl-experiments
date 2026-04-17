@@ -6,7 +6,9 @@ Tabular Hybrid-FMUCB helpers aligned with:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
+
+LeaderFeasibility = Literal["pessimistic"]
 
 import numpy as np
 
@@ -233,37 +235,26 @@ def pooled_mean(sum_r: np.ndarray, n_visits: np.ndarray) -> np.ndarray:
     return sum_r.astype(np.float64) / n
 
 
-def hybrid_fmucb_pick(
-    a_t: int,
-    n_visits: np.ndarray,
-    sum_r_f: np.ndarray,
+def select_best_feasible_manipulation_rule(
     sum_r_l: np.ndarray,
+    sum_r_f: np.ndarray,
+    n_visits: np.ndarray,
     t: int,
     n_a: int,
     n_b: int,
-    rng: np.random.Generator,
-    delta: float = 0.05,
+    delta: float,
     eps: float = 1e-9,
-) -> Tuple[int, bool]:
+) -> Tuple[Optional[np.ndarray], int, int, float]:
     """
-    Tabular Hybrid-FMUCB step (Algorithm 1, tabular reduction).
+    Algorithm 1, lines 6--7 (tabular): among certifiably feasible (F, a*) in M_t,
+    return argmax of optimistic follower value mu_hat_f(a*,b*) + w_t(a*,b*).
 
-    Feasibility (pessimistic, Alg 1 line 6):
-        inf_{g in G_{l,t}} Delta_{F,a*}(g) > 0
-        implemented as: LCB_l(a*, F(a*)) - max_{a'!=a*} UCB_l(a', F(a')) > eps
-        using regression_confidence_radius (calibrated to Bernoulli rewards).
-
-    Follower objective (optimistic, Alg 1 line 7):
-        sup_{gf in G_{f,t}} gf(a*, F(a*))
-        = mu_hat_f(a*, b*) + w_t(a*, b*)
-
-    Returns (b_t, fallback_used).
-    fallback_used=True when M_t={} and UCB best-response is played instead.
+    Returns (F, a_star, b_star, best_ucb_f). If M_t is empty, (None, -1, -1, -inf).
     """
     mu_l_hat = pooled_mean(sum_r_l, n_visits)
-
     best_ucb_f = -np.inf
     best_F: Optional[np.ndarray] = None
+    best_a, best_b = -1, -1
 
     for a_star in range(n_a):
         for b_star in range(n_b):
@@ -279,7 +270,122 @@ def hybrid_fmucb_pick(
             ucb_f = mean_f + w_f
             if ucb_f > best_ucb_f:
                 best_ucb_f = ucb_f
-                best_F = F
+                best_F = F.copy()
+                best_a, best_b = a_star, b_star
+
+    if best_F is None:
+        return None, -1, -1, float(-np.inf)
+    return best_F, best_a, best_b, best_ucb_f
+
+
+def offline_candidate_manipulation(
+    sum_r_l: np.ndarray,
+    sum_r_f: np.ndarray,
+    n_visits_offline: np.ndarray,
+    n_a: int,
+    n_b: int,
+    delta: float,
+    eps: float = 1e-9,
+    t_init: int = 1,
+) -> Tuple[Optional[np.ndarray], int, int, float]:
+    """
+    Algorithm 1, lines 1--2: offline-only confidence sets G_{l,0}, G_{f,0} from D_off,
+    then compute (F_0, a_0) maximizing follower optimistic value subject to feasibility.
+
+    Uses pooled statistics from offline data only; time index ``t_init`` (default 1)
+    matches the first online round before any new sample (same radii as first call to
+    ``hybrid_fmucb_pick`` when online counts are still zero).
+    """
+    return select_best_feasible_manipulation_rule(
+        sum_r_l,
+        sum_r_f,
+        n_visits_offline,
+        t_init,
+        n_a,
+        n_b,
+        delta,
+        eps,
+    )
+
+
+def theorem1_offline_transfer_check(
+    mu_l_true: np.ndarray,
+    mu_f: np.ndarray,
+    n_visits_offline: np.ndarray,
+    sum_r_l_offline: np.ndarray,
+    n_a: int,
+    n_b: int,
+) -> Tuple[bool, float, float, float]:
+    """
+    Theorem 1, condition 4: C_man * sqrt(E_nu[(hat_mu_l - mu_l)^2]) <= Delta_3 / 4
+    for the true best manipulation (F^fm, a^fm).
+
+    Returns (ok, lhs, threshold, delta3). If no qualified manipulation exists (delta3<=0),
+    returns (False, nan, nan, delta3).
+    """
+    F_fm, a_fm = true_best_manipulation(mu_l_true, mu_f)
+    delta3 = manipulation_contrast(mu_l_true, F_fm, a_fm)
+    if delta3 <= 1e-12:
+        return False, float("nan"), float("nan"), float(delta3)
+    mu_l_hat = pooled_mean(sum_r_l_offline, n_visits_offline)
+    ok, lhs, thr = certify_offline(
+        F_fm,
+        a_fm,
+        mu_l_hat,
+        mu_l_true,
+        n_visits_offline.astype(np.float64),
+        float(delta3),
+        n_a,
+        n_b,
+    )
+    return ok, lhs, thr, float(delta3)
+
+
+def hybrid_fmucb_pick(
+    a_t: int,
+    n_visits: np.ndarray,
+    sum_r_f: np.ndarray,
+    sum_r_l: np.ndarray,
+    t: int,
+    n_a: int,
+    n_b: int,
+    rng: np.random.Generator,
+    delta: float = 0.05,
+    eps: float = 1e-9,
+    *,
+    follower_elim_eps: Optional[float] = None,
+    leader_feasibility: LeaderFeasibility = "pessimistic",
+    feasibility_margin: float = 0.0,
+) -> Tuple[int, bool]:
+    """
+    Tabular Hybrid-FMUCB step (Algorithm 1, tabular reduction).
+
+    Feasibility (pessimistic, Alg 1 line 6):
+        inf_{g in G_{l,t}} Delta_{F,a*}(g) > 0
+        implemented as: LCB_l(a*, F(a*)) - max_{a'!=a*} UCB_l(a', F(a')) > eps
+        using regression_confidence_radius (calibrated to Bernoulli rewards).
+
+    Follower objective (optimistic, Alg 1 line 7):
+        sup_{gf in G_{f,t}} gf(a*, F(a*))
+        = mu_hat_f(a*, b*) + w_t(a*, b*)
+
+    Returns (b_t, fallback_used).
+    fallback_used=True when M_t={} and UCB best-response is played instead.
+
+    Optional kwargs match ``experiment_common`` / older scripts: only pessimistic
+    leader feasibility is implemented; ``feasibility_margin`` tightens the
+    feasibility threshold additively on ``eps``.
+    """
+    if leader_feasibility != "pessimistic":
+        raise ValueError(
+            "only leader_feasibility='pessimistic' is implemented "
+            f"(got {leader_feasibility!r})"
+        )
+    eps_base = follower_elim_eps if follower_elim_eps is not None else eps
+    eps_eff = float(eps_base) + float(feasibility_margin)
+    best_F, _, _, _ = select_best_feasible_manipulation_rule(
+        sum_r_l, sum_r_f, n_visits, t, n_a, n_b, delta, eps_eff
+    )
 
     if best_F is None:
         # Deviation 4 fallback: UCB best-response on mu_f(a_t, .)
