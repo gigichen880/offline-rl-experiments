@@ -67,15 +67,14 @@ def regression_confidence_radius(
     For tabular [0,1]-bounded Bernoulli rewards the ERM is the empirical mean.
     A union-bounded Hoeffding inequality over |A|*|B| cells and t^2 rounds gives:
 
-        beta_t = 2 * log(2 * |A| * |B| * t^2 / delta)
-        w_t(a,b) = sqrt(beta_t / max(1, N_t(a,b)))
+        w_t(a,b) = sqrt( log(2 * |A| * |B| * t^2 / delta) / (2 * N_t(a,b)) )
 
     This is the tabular special case of the regression confidence set radius
-    beta_t in Algorithm 1 (paper Sec. 2 and Appendix D).
+    in Algorithm 1 (paper Sec. 2 and Appendix D).
     """
-    beta_t = 2.0 * np.log(2.0 * n_a * n_b * max(1, t) ** 2 / delta)
+    log_term = np.log(2.0 * n_a * n_b * max(1, t) ** 2 / delta)
     n = max(1, int(n_visits))
-    return float(np.sqrt(beta_t / n))
+    return float(np.sqrt(log_term / (2.0 * n)))
 
 
 # ---------------------------------------------------------------------------
@@ -140,25 +139,20 @@ def compute_c_man(
     Qualified-manipulation transfer coefficient C_man(F, a*) from Eq. (3):
 
         C_man(F, a*) = max(0,
-            sup_{g in G, h=g-mu_l}  Delta_{F,a*}(h)
+            sup_{h in H}  Delta_{F,a*}(h)
             / sqrt(E_{(a,b)~nu}[h(a,b)^2])
         )
 
-    For the tabular function class G with uniform pointwise radius eps around
-    mu_l, h(a,b) = g(a,b) - mu_l(a,b) in [-eps, eps].
+    For the tabular function class, the sup is achieved via Cauchy-Schwarz.
+    The contrast Delta_{F,a*}(h) = h(a*, F(a*)) - max_{a!=a*} h(a, F(a))
+    depends on at most |A| cells of the form (a, F(a)).  Write
+    nu_a := nu(a, F(a)) / nu_total for these cells.  The optimal h
+    concentrates mass on the target cell and one competitor, giving:
 
-    The numerator Delta_{F,a*}(h) = h(a*, F(a*)) - max_{a!=a*} h(a, F(a)).
-    Worst-case sup over G: set h(a*, F(a*)) = +eps and h(a, F(a)) = -eps for
-    the one a' that achieves the max.  So sup numerator = 2*eps (two relevant cells).
+        C_man = sqrt(1/nu(a*, F(a*)) + 1/nu(a', F(a')))
 
-    Denominator: sqrt(E_nu[h^2]).  With h concentrated on the two relevant cells
-    and h(a,b)=eps there:
-        E_nu[h^2] = eps^2 * (nu(a*, F(a*)) + nu(a', F(a'))) / nu_total
-
-    After dividing out eps:
-        C_man = 2 / sqrt((nu(a*, F(a*)) + nu(a_argmax, F(a_argmax))) / nu_total)
-
-    We sum over all a' != a* in the denominator (conservative: all could be argmax).
+    where a' is the competitor with least coverage.  We use the
+    worst-case (minimum coverage) competitor for a tight bound.
 
     Parameters
     ----------
@@ -171,20 +165,27 @@ def compute_c_man(
     if nu_total <= 0.0:
         return float("inf")
 
-    # Cells relevant to Delta_{F,a*}: (a*, F(a*)) and all (a, F(a)) for a != a*
-    nu_relevant = float(nu_counts[a_star, int(F[a_star])])
-    for a in range(n_a):
-        if a != a_star:
-            nu_relevant += float(nu_counts[a, int(F[a])])
-
-    if nu_relevant <= 0.0:
+    # Target cell coverage
+    nu_target = float(nu_counts[a_star, int(F[a_star])])
+    if nu_target <= 0.0:
         return float("inf")
 
-    # C_man = (1 + 1) / sqrt(nu_relevant / nu_total)  [target + 1 worst other]
-    # More conservatively, count all n_a-1 other cells as potential argmax:
-    # numerator = 2 (target gets +eps, one other gets -eps -> contrast = 2eps)
-    denom_factor = float(np.sqrt(nu_relevant / nu_total))
-    c_man = 2.0 / denom_factor
+    # Find the competitor with minimum coverage (worst case for C_man)
+    min_nu_other = float("inf")
+    for a in range(n_a):
+        if a != a_star:
+            nu_a = float(nu_counts[a, int(F[a])])
+            if nu_a <= 0.0:
+                return float("inf")
+            if nu_a < min_nu_other:
+                min_nu_other = nu_a
+
+    if min_nu_other == float("inf"):
+        # Only one leader action; no competitor
+        return 0.0
+
+    # C_man = sqrt(nu_total / nu_target + nu_total / min_nu_other)
+    c_man = float(np.sqrt(nu_total / nu_target + nu_total / min_nu_other))
     return float(max(0.0, c_man))
 
 
