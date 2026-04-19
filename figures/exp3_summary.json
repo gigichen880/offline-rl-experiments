@@ -1,10 +1,11 @@
 {
-  "n_off": 800,
+  "algorithm_1": "non_contextual_per_context_tabular_hybrid_fmucb",
+  "algorithm_2": "full_contextual_hybrid_fmucb_linucb",
+  "reward_model": "Bernoulli",
+  "n_off": 1500,
   "n_x": 5,
-  "n_a": 8,
-  "n_b": 8,
-  "tfw_tabular_mean": 2314.0,
-  "tfw_contextual_mean": 1538.25,
-  "final_window_optimality_tabular_mean": 0.2665,
-  "final_window_optimality_contextual_mean": 0.49599999999999994
+  "n_a": 4,
+  "n_b": 4,
+  "tfw_non_contextual_mean": 5420.375,
+  "tfw_contextual_mean": 3402.8958333333335
 }
