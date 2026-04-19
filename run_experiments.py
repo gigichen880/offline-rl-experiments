@@ -80,6 +80,35 @@ class StackelbergBandit:
             rng.uniform(0.0, 1.0, (n_a, n_b)),
         )
 
+    @classmethod
+    def fixed_4x4(cls) -> "StackelbergBandit":
+        """A hand-designed 4x4 game with clean manipulation structure.
+
+        Properties (verified analytically):
+          - Stackelberg equilibrium: (a=0, b=0) — leader gets 0.85, follower gets 0.40
+          - Best manipulation: target a=1, F_fm(1)=b1 — follower gets 0.90
+            F_fm = [3, 1, 3, 3] (worst responses at non-target actions)
+          - Under manipulation, leader sees:
+              a=0: 0.10, a=1: 0.65, a=2: 0.10, a=3: 0.05
+            so leader uniquely prefers a=1.
+          - Delta_3 = 0.55  (manipulation contrast)
+          - Delta_5 = 0.20  (min worst-response identification gap)
+          - Follower gain from manipulation: 0.90 vs 0.40 (Stackelberg)
+        """
+        mu_l = np.array([
+            [0.85, 0.70, 0.30, 0.10],   # a=0: SE target, wr=b3(0.10)
+            [0.50, 0.65, 0.30, 0.10],   # a=1: manipulation target, wr=b3(0.10)
+            [0.45, 0.35, 0.55, 0.10],   # a=2: wr=b3(0.10)
+            [0.40, 0.30, 0.50, 0.05],   # a=3: wr=b3(0.05)
+        ])
+        mu_f = np.array([
+            [0.40, 0.30, 0.20, 0.10],   # BR(0)=b0, follower gets 0.40 (SE payoff)
+            [0.25, 0.90, 0.40, 0.35],   # BR(1)=b1, follower gets 0.90 (manipulation payoff!)
+            [0.50, 0.60, 0.30, 0.45],   # BR(2)=b1
+            [0.35, 0.55, 0.65, 0.50],   # BR(3)=b2
+        ])
+        return cls(mu_l, mu_f)
+
     @property
     def n_a(self) -> int:
         return self.mu_leader.shape[0]
@@ -154,14 +183,25 @@ def build_offline_uniform(
 def build_offline_good_coverage(
     env: StackelbergBandit, n_off: int, rng: np.random.Generator
 ) -> OfflineRewardStats:
+    """Good coverage: concentrate on manipulation-relevant cells.
+
+    The follower needs coverage on the cells that appear in the manipulation
+    contrast Delta_{F,a*}(mu_l), i.e. (a_fm, F_fm(a_fm)) and (a, F_fm(a))
+    for a != a_fm.  This is what low C_man means.
+
+    Split: 60% on manipulation-relevant cells (a, F_fm(a)),
+           20% on follower BR cells, 20% uniform.
+    """
     n_a, n_b = env.n_a, env.n_b
     nv = np.zeros((n_a, n_b), dtype=np.int64)
     sf = np.zeros((n_a, n_b)); sl = np.zeros((n_a, n_b))
-    a_star = env.stackelberg_leader_action(); b_star = env.follower_br(a_star)
+    F_fm, a_fm = true_best_manipulation(env.mu_leader, env.mu_follower)
+    # Manipulation-relevant cells: (a, F_fm(a)) for each a
+    manip_cells = [(a, int(F_fm[a])) for a in range(n_a)]
     for _ in range(n_off):
         u = rng.random()
-        if u < 0.4:
-            a, b = a_star, b_star
+        if u < 0.6:
+            a, b = manip_cells[int(rng.integers(0, len(manip_cells)))]
         elif u < 0.8:
             a = int(rng.integers(0, n_a)); b = env.follower_br(a)
         else:
@@ -415,13 +455,28 @@ def experiment1(
     thm1_transfer_hybrid = np.full((len(seeds), len(n_off_list)), np.nan)
     offline_m0_hybrid = np.full((len(seeds), len(n_off_list)), np.nan)
 
+    # Use fixed game for controlled gaps; all seeds see the same game,
+    # variance comes only from stochastic rewards / EXP3 randomness.
+    fixed_env = StackelbergBandit.fixed_4x4() if (n_a == 4 and n_b == 4) else None
+
     for si, seed in enumerate(
         tqdm(seeds, desc="Exp 1", unit="seed", disable=not progress)
     ):
         rng = np.random.default_rng(seed)
-        env = StackelbergBandit.sample(n_a, n_b, rng)
-        # Inner bar: each cell is 2×horizon (baseline + hybrid); outer "Exp 1" seed bar
-        # only moves after all N_off grid points for that seed finish.
+        env = fixed_env if fixed_env is not None else StackelbergBandit.sample(n_a, n_b, rng)
+
+        # Run baseline ONCE per seed (it doesn't use offline data, so the
+        # result must be identical across N_off values).
+        rng_baseline = np.random.default_rng(seed * 100_000 + 7)
+        tr_baseline = simulate_run(
+            env, horizon, rng_baseline, gamma_exp3=gamma_exp3, delta=delta
+        )
+        baseline_tfw = tr_baseline["subopt"].sum()
+        baseline_conv = convergence_round(
+            tr_baseline["subopt"], conv_win, conv_thr, conv_k
+        )
+        baseline_cum = np.cumsum(tr_baseline["subopt"].astype(float))
+
         n_off_indices = range(len(n_off_list))
         if progress:
             n_off_indices = tqdm(
@@ -432,22 +487,21 @@ def experiment1(
             )
         for j in n_off_indices:
             n_off = n_off_list[j]
-            rng_b = np.random.default_rng(seed * 100_000 + j + 7)
+            rng_off = np.random.default_rng(seed * 100_000 + j + 11)
             rng_h = np.random.default_rng(seed * 100_000 + j + 13)
-            off = build_offline_uniform(env, n_off, rng_b) if n_off > 0 else None
-            tr_b = simulate_run(env, horizon, rng_b, gamma_exp3=gamma_exp3, delta=delta)
+            off = build_offline_uniform(env, n_off, rng_off) if n_off > 0 else None
             tr_h = simulate_run(
                 env, horizon, rng_h, gamma_exp3=gamma_exp3, offline_init=off, delta=delta
             )
             if n_off > 0:
                 thm1_transfer_hybrid[si, j] = float(tr_h["theorem1_transfer_ok"][0])
                 offline_m0_hybrid[si, j] = float(tr_h["offline_m0_nonempty"][0])
-            t_fw_base[si, j] = tr_b["subopt"].sum()
+            t_fw_base[si, j] = baseline_tfw
             t_fw_hyb[si, j] = tr_h["subopt"].sum()
-            conv_base[si, j] = convergence_round(tr_b["subopt"], conv_win, conv_thr, conv_k)
+            conv_base[si, j] = baseline_conv
             conv_hyb[si, j] = convergence_round(tr_h["subopt"], conv_win, conv_thr, conv_k)
             if n_off == cum_target:
-                cum_base_rows.append(np.cumsum(tr_b["subopt"].astype(float)))
+                cum_base_rows.append(baseline_cum)
                 cum_hyb_rows.append(np.cumsum(tr_h["subopt"].astype(float)))
 
     x_labels = [str(n) for n in n_off_list]
@@ -546,7 +600,7 @@ def experiment2(
             tqdm(seeds, desc=f"Exp 2 ({kind})", unit="seed", disable=not progress)
         ):
             rng = np.random.default_rng(seed)
-            env = StackelbergBandit.sample(n_a, n_b, rng)
+            env = StackelbergBandit.fixed_4x4() if (n_a == 4 and n_b == 4) else StackelbergBandit.sample(n_a, n_b, rng)
             rng_off = np.random.default_rng(seed + 91_000)
             rng_on = np.random.default_rng(seed + 92_000)
             builders = {
@@ -569,7 +623,7 @@ def experiment2(
             success[kind][si] = 1.0 - tr["subopt"][-min(500, horizon):].mean()
             sub_at_star[kind][si] = follower_subopt_rate_at_a_star(tr, env)
 
-    labels = ["Good (includes\n$(a^*, b^*)$)", "Neutral\n(uniform)", "Poor (never\n$(a^*, b^*)$)"]
+    labels = ["Good (manip.\nrelevant)", "Neutral\n(uniform)", "Poor (avoids\nmanip. cells)"]
     colors_b = [COLORS["good"], COLORS["neutral"], COLORS["poor"]]
 
     fig, axes = plt.subplots(1, 3, figsize=(18.0, 4.8))
@@ -653,9 +707,10 @@ def learning_curve_figure(
             f"(per-round tqdm inside each simulate_run; outer bar = seeds).",
             flush=True,
         )
+    fixed_env = StackelbergBandit.fixed_4x4() if (n_a == 4 and n_b == 4) else None
     for seed in tqdm(seeds, desc="Learning curves", unit="seed", disable=not progress):
         rng = np.random.default_rng(seed)
-        env = StackelbergBandit.sample(n_a, n_b, rng)
+        env = fixed_env if fixed_env is not None else StackelbergBandit.sample(n_a, n_b, rng)
         a_star_env = int(env.stackelberg_leader_action())
         rng_b = np.random.default_rng(seed + 3)
         rng_h = np.random.default_rng(seed + 5)
@@ -1144,10 +1199,10 @@ def main() -> None:
         description="Stackelberg bandit offline-online experiments"
     )
     parser.add_argument("--out-dir", type=str, default="figures")
-    parser.add_argument("--seeds", type=int, default=24)
+    parser.add_argument("--seeds", type=int, default=48)
     parser.add_argument("--base-seed", type=int, default=0)
-    parser.add_argument("--n-a", type=int, default=8)
-    parser.add_argument("--n-b", type=int, default=8)
+    parser.add_argument("--n-a", type=int, default=4)
+    parser.add_argument("--n-b", type=int, default=4)
     parser.add_argument("--horizon", type=int, default=8000)
     parser.add_argument(
         "--gamma-exp3",
@@ -1222,7 +1277,7 @@ def main() -> None:
 
     os.makedirs(args.out_dir, exist_ok=True)
     seeds = [args.base_seed + i for i in range(args.seeds)]
-    n_off_grid = [0, 100, 500, 1000, 5000]
+    n_off_grid = [0, 100, 500, 1000, 2000, 5000]
     show_p = not args.no_progress
 
     if args.learning_curves_only:
